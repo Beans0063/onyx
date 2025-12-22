@@ -1,6 +1,5 @@
 locals {
-  name   = "onyx-prod"
-  region = "us-west-2"
+  name = "onyx-prod"
   tags = {
     Environment = "prod"
     Project     = "onyx"
@@ -8,7 +7,7 @@ locals {
 }
 
 provider "aws" {
-  region = local.region
+  region = var.region
   default_tags {
     tags = local.tags
   }
@@ -19,33 +18,36 @@ provider "aws" {
 # ---------------------------------------------------------------------------------------------------------------------
 
 module "vpc" {
-  source = "../../modules/aws/vpc"
+  source = "../../../modules/aws/vpc"
   
-  vpc_name = "${local.name}-vpc"
-  tags     = local.tags
+  vpc_name           = "${local.name}-vpc"
+  single_nat_gateway = true # POC: Save cost by using 1 NAT GW instead of 1 per AZ
+  tags               = local.tags
 }
 
 module "postgres" {
-  source = "../../modules/aws/postgres"
+  source = "../../../modules/aws/postgres"
 
   identifier    = "${local.name}-postgres"
   vpc_id        = module.vpc.vpc_id
   subnet_ids    = module.vpc.private_subnets
   ingress_cidrs = [module.vpc.vpc_cidr_block]
-  username      = "onyx_root"
-  password      = "ChangeMe123!" # In real life, use Secrets Manager
+  username      = var.postgres_username
+  password      = var.postgres_password
+  instance_type = "db.t4g.micro" # POC: Smallest instance
+  storage_gb    = 10              # POC: Minimal storage
   tags          = local.tags
 }
 
 module "redis" {
-  source        = "../../modules/aws/redis"
+  source        = "../../../modules/aws/redis"
   name          = "${local.name}-redis"
   vpc_id        = module.vpc.vpc_id
   subnet_ids    = module.vpc.private_subnets
   instance_type = "cache.t4g.micro"
   ingress_cidrs = [module.vpc.vpc_cidr_block]
   tags          = local.tags
-  auth_token    = "ChangeMeRedis!"
+  auth_token    = var.redis_auth_token
 }
 
 resource "aws_security_group" "alb_sg" {
@@ -85,10 +87,67 @@ resource "aws_lb" "main" {
   enable_deletion_protection = false
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
+# SSL CERTIFICATE (ACM)
+# ---------------------------------------------------------------------------------------------------------------------
+resource "aws_acm_certificate" "main" {
+  domain_name               = "demo.vigilon.app"
+  subject_alternative_names = ["*.vigilon.app"] # Wildcard for future tenants
+  validation_method         = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = local.tags
+}
+
+# Output the DNS validation records (you'll need to add these to your DNS)
+output "acm_validation_records" {
+  description = "Add these CNAME records to your DNS to validate the certificate"
+  value = {
+    for dvo in aws_acm_certificate.main.domain_validation_options : dvo.domain_name => {
+      name  = dvo.resource_record_name
+      type  = dvo.resource_record_type
+      value = dvo.resource_record_value
+    }
+  }
+}
+
+# Wait for certificate validation (will hang until DNS records are added)
+resource "aws_acm_certificate_validation" "main" {
+  certificate_arn = aws_acm_certificate.main.arn
+  # Remove this line if you want terraform apply to complete before DNS validation
+  # validation_record_fqdns = [for record in aws_acm_certificate.main.domain_validation_options : record.resource_record_name]
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# LOAD BALANCER LISTENERS
+# ---------------------------------------------------------------------------------------------------------------------
+
+# HTTP listener - redirects to HTTPS
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = "80"
   protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# HTTPS listener
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = aws_acm_certificate.main.arn
 
   default_action {
     type = "fixed-response"
@@ -98,6 +157,8 @@ resource "aws_lb_listener" "http" {
       status_code  = "404"
     }
   }
+
+  depends_on = [aws_acm_certificate_validation.main]
 }
 
 resource "aws_ecs_cluster" "main" {
@@ -105,20 +166,142 @@ resource "aws_ecs_cluster" "main" {
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
+# GITHUB ACTIONS OIDC (for CI/CD to push to ECR)
+# ---------------------------------------------------------------------------------------------------------------------
+
+data "aws_iam_openid_connect_provider" "github" {
+  count = length(data.aws_iam_openid_connect_providers.github.arns) > 0 ? 1 : 0
+  arn   = data.aws_iam_openid_connect_providers.github.arns[0]
+}
+
+data "aws_iam_openid_connect_providers" "github" {}
+
+resource "aws_iam_openid_connect_provider" "github" {
+  count           = length(data.aws_iam_openid_connect_providers.github.arns) == 0 ? 1 : 0
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1", "1c58a3a8518e8759bf075b76b750d4f2df264fcd"]
+}
+
+resource "aws_iam_role" "github_actions" {
+  name = "${local.name}-github-actions"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = length(data.aws_iam_openid_connect_providers.github.arns) > 0 ? data.aws_iam_openid_connect_providers.github.arns[0] : aws_iam_openid_connect_provider.github[0].arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringLike = {
+            "token.actions.githubusercontent.com:sub" = "repo:Beans0063/onyx:*"
+          }
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy" "github_actions_ecr" {
+  name = "${local.name}-github-ecr"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload"
+        ]
+        Resource = [
+          "arn:aws:ecr:us-west-2:008939990372:repository/onyx/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecs:UpdateService"
+        ]
+        Resource = [
+          "arn:aws:ecs:us-west-2:008939990372:service/onyx-prod-cluster/*"
+        ]
+      }
+    ]
+  })
+}
+
+output "github_actions_role_arn" {
+  description = "ARN of the IAM role for GitHub Actions - add as AWS_ROLE_ARN secret"
+  value       = aws_iam_role.github_actions.arn
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
 # VESPA (EC2)
 # ---------------------------------------------------------------------------------------------------------------------
+
+# IAM Role for SSM access (allows Session Manager connections)
+resource "aws_iam_role" "vespa_ssm_role" {
+  name = "${local.name}-vespa-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "vespa_ssm_policy" {
+  role       = aws_iam_role.vespa_ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "vespa_profile" {
+  name = "${local.name}-vespa-profile"
+  role = aws_iam_role.vespa_ssm_role.name
+}
+
 # Simplified deployment of Vespa on a single EC2 instance for shared usage
 module "vespa_ec2" {
   source = "terraform-aws-modules/ec2-instance/aws"
   name   = "${local.name}-vespa"
 
-  instance_type          = "t3.xlarge"
+  instance_type          = "t3.medium" # POC: Reduced from xlarge. Warning: Performance impactful.
   vpc_security_group_ids = [aws_security_group.vespa_sg.id]
   subnet_id              = module.vpc.private_subnets[0]
-  
+  iam_instance_profile   = aws_iam_instance_profile.vespa_profile.name
+
   user_data = <<-EOF
               #!/bin/bash
-              yum install -y docker
+              yum install -y docker postgresql15
               service docker start
               docker run -d --name vespa --hostname vespa-container \
                 -p 8081:8081 -p 19071:19071 \
@@ -159,48 +342,66 @@ resource "aws_security_group" "vespa_sg" {
 # TENANTS
 # ---------------------------------------------------------------------------------------------------------------------
 
-module "tenant_a" {
-  source = "../../modules/aws/onyx_tenant"
-  
+module "tenant_demo" {
+  source = "../../../modules/aws/onyx_tenant"
+
   tenant_name = "customer-a"
   environment = "prod"
-  
-  vpc_id              = module.vpc.vpc_id
-  private_subnet_ids  = module.vpc.private_subnets
-  ecs_cluster_id      = aws_ecs_cluster.main.id
-  alb_listener_arn    = aws_lb_listener.http.arn
+
+  vpc_id                = module.vpc.vpc_id
+  private_subnet_ids    = module.vpc.private_subnets
+  ecs_cluster_id        = aws_ecs_cluster.main.id
+  alb_listener_arn      = aws_lb_listener.https.arn
   alb_security_group_id = aws_security_group.alb_sg.id
-  
-  alb_dns_name = "customer-a.example.com"
-  domain_name  = "http://customer-a.example.com"
-  
-  postgres_host      = module.postgres.db_instance_address
-  postgres_user      = "onyx_root"
-  postgres_password  = "ChangeMe123!"
-  postgres_db        = "onyx_customer_a" # Logic to ensure this DB exists needed elsewhere
-  
-  vespa_host         = module.vespa_ec2.private_ip
+
+  alb_dns_name = "demo.vigilon.app"
+  domain_name  = "https://demo.vigilon.app"
+
+  # Use ECR images instead of Docker Hub (avoids rate limiting)
+  web_image     = "008939990372.dkr.ecr.us-west-2.amazonaws.com/onyx/web-server"
+  backend_image = "008939990372.dkr.ecr.us-west-2.amazonaws.com/onyx/backend"
+
+  # Shared services
+  postgres_host     = module.postgres.endpoint
+  postgres_user     = var.postgres_username
+  postgres_password = var.postgres_password
+  postgres_db       = "onyx_customer_a"
+  vespa_host        = module.vespa_ec2.private_ip
+  redis_host        = module.redis.redis_endpoint
+
+  # Cloud embeddings - configure via Onyx Admin UI after deployment
+  # No model servers needed - saves ~$60/month!
+
+  container_cpu    = 512  # POC: 0.5 vCPU
+  container_memory = 1024 # POC: 1 GB RAM
 }
 
-module "tenant_b" {
-  source = "../../modules/aws/onyx_tenant"
-  
-  tenant_name = "customer-b"
-  environment = "prod"
-  
-  vpc_id              = module.vpc.vpc_id
-  private_subnet_ids  = module.vpc.private_subnets
-  ecs_cluster_id      = aws_ecs_cluster.main.id
-  alb_listener_arn    = aws_lb_listener.http.arn
-  alb_security_group_id = aws_security_group.alb_sg.id
-  
-  alb_dns_name = "customer-b.example.com"
-  domain_name  = "http://customer-b.example.com"
-  
-  postgres_host      = module.postgres.db_instance_address
-  postgres_user      = "onyx_root"
-  postgres_password  = "ChangeMe123!"
-  postgres_db        = "onyx_customer_b"
-  
-  vespa_host         = module.vespa_ec2.private_ip
-}
+# Uncomment to add another tenant
+# module "tenant_b" {
+#   source = "../../../modules/aws/onyx_tenant"
+#
+#   tenant_name = "customer-b"
+#   environment = "prod"
+#
+#   vpc_id                = module.vpc.vpc_id
+#   private_subnet_ids    = module.vpc.private_subnets
+#   ecs_cluster_id        = aws_ecs_cluster.main.id
+#   alb_listener_arn      = aws_lb_listener.https.arn
+#   alb_security_group_id = aws_security_group.alb_sg.id
+#
+#   alb_dns_name = "customer-b.vigilon.app"
+#   domain_name  = "https://customer-b.vigilon.app"
+#
+#   web_image     = "008939990372.dkr.ecr.us-west-2.amazonaws.com/onyx/web-server"
+#   backend_image = "008939990372.dkr.ecr.us-west-2.amazonaws.com/onyx/backend"
+#
+#   postgres_host     = module.postgres.endpoint
+#   postgres_user     = var.postgres_username
+#   postgres_password = var.postgres_password
+#   postgres_db       = "onyx_customer_b"
+#   vespa_host        = module.vespa_ec2.private_ip
+#   redis_host        = module.redis.redis_endpoint
+#
+#   container_cpu    = 512
+#   container_memory = 1024
+# }

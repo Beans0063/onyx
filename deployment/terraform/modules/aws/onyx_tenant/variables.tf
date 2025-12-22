@@ -62,11 +62,7 @@ variable "web_image" {
   default     = "onyxdotapp/onyx-web-server"
 }
 
-variable "model_server_image" {
-  description = "Docker image for model server"
-  type        = string
-  default     = "onyxdotapp/onyx-model-server"
-}
+# NOTE: model_server_image removed - using cloud embedding APIs instead
 
 # Database Configs
 variable "postgres_host" {
@@ -92,8 +88,14 @@ variable "postgres_db" {
 
 # Search Configs
 variable "vespa_host" {
-    description = "Shared Vespa Host URL"
-    type = string
+  description = "Shared Vespa Host URL"
+  type        = string
+}
+
+# Cache Configs
+variable "redis_host" {
+  description = "Shared Redis/ElastiCache Host"
+  type        = string
 }
 
 # App Configs

@@ -98,11 +98,13 @@ resource "aws_ecs_task_definition" "app" {
   execution_role_arn       = aws_iam_role.execution_role.arn
   task_role_arn            = aws_iam_role.task_role.arn
 
+  # Container definitions - uses cloud embedding APIs (OpenAI/Cohere/etc.)
+  # Model servers removed for cost savings. Configure embedding provider via Onyx Admin UI.
   container_definitions = jsonencode([
     # WEB SERVER
     {
-      name  = "web_server"
-      image = "${var.web_image}:${var.image_tag}"
+      name      = "web_server"
+      image     = "${var.web_image}:${var.image_tag}"
       essential = true
       portMappings = [
         {
@@ -120,17 +122,17 @@ resource "aws_ecs_task_definition" "app" {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.logs.name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "web"
         }
       }
     },
     # API SERVER
     {
-      name  = "api_server"
-      image = "${var.backend_image}:${var.image_tag}"
+      name      = "api_server"
+      image     = "${var.backend_image}:${var.image_tag}"
       essential = true
-      command = ["/bin/sh", "-c", "alembic upgrade head && echo 'Starting Onyx Api Server' && uvicorn onyx.main:app --host 0.0.0.0 --port 8080"]
+      command   = ["/bin/sh", "-c", "alembic upgrade head && echo 'Starting Onyx Api Server' && uvicorn onyx.main:app --host 0.0.0.0 --port 8080"]
       portMappings = [
         {
           containerPort = 8080
@@ -145,88 +147,43 @@ resource "aws_ecs_task_definition" "app" {
         { name = "POSTGRES_PASSWORD", value = var.postgres_password },
         { name = "POSTGRES_DB", value = var.postgres_db },
         { name = "VESPA_HOST", value = var.vespa_host },
-        { name = "MODEL_SERVER_HOST", value = "localhost" },
-        { name = "INDEXING_MODEL_SERVER_HOST", value = "localhost" },
-        { name = "INDEXING_MODEL_SERVER_PORT", value = "9001" },
+        { name = "REDIS_HOST", value = var.redis_host },
         { name = "WEB_DOMAIN", value = var.domain_name },
+        # Disable local model server - using cloud embedding APIs
+        { name = "DISABLE_MODEL_SERVER", value = "True" },
       ]
       logConfiguration = {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.logs.name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "api"
         }
       }
     },
     # BACKGROUND WORKER
     {
-      name  = "background"
-      image = "${var.backend_image}:${var.image_tag}"
+      name      = "background"
+      image     = "${var.backend_image}:${var.image_tag}"
       essential = true
-      command = ["/bin/sh", "-c", "/app/scripts/supervisord_entrypoint.sh"]
+      command   = ["/bin/sh", "-c", "/app/scripts/supervisord_entrypoint.sh"]
       environment = [
         { name = "POSTGRES_HOST", value = var.postgres_host },
         { name = "POSTGRES_USER", value = var.postgres_user },
         { name = "POSTGRES_PASSWORD", value = var.postgres_password },
         { name = "POSTGRES_DB", value = var.postgres_db },
         { name = "VESPA_HOST", value = var.vespa_host },
-        { name = "MODEL_SERVER_HOST", value = "localhost" },
-        { name = "INDEXING_MODEL_SERVER_HOST", value = "localhost" },
-        { name = "INDEXING_MODEL_SERVER_PORT", value = "9001" },
+        { name = "REDIS_HOST", value = var.redis_host },
         { name = "WEB_DOMAIN", value = var.domain_name },
+        # Disable local model server - using cloud embedding APIs
+        { name = "DISABLE_MODEL_SERVER", value = "True" },
       ]
       logConfiguration = {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.logs.name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "background"
-        }
-      }
-    },
-    # INFERENCE MODEL SERVER
-    {
-      name  = "inference_model_server"
-      image = "${var.model_server_image}:${var.image_tag}"
-      essential = true
-      command = ["uvicorn", "model_server.main:app", "--host", "0.0.0.0", "--port", "9000"]
-      portMappings = [
-        {
-            containerPort = 9000
-            hostPort = 9000
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.logs.name
-          "awslogs-region"        = data.aws_region.current.name
-          "awslogs-stream-prefix" = "inference_model"
-        }
-      }
-    },
-    # INDEXING MODEL SERVER (Port 9001)
-    {
-      name  = "indexing_model_server"
-      image = "${var.model_server_image}:${var.image_tag}"
-      essential = true
-      command = ["uvicorn", "model_server.main:app", "--host", "0.0.0.0", "--port", "9001"]
-      environment = [
-          { name = "INDEXING_ONLY", value = "True" }
-      ]
-      portMappings = [
-        {
-            containerPort = 9001
-            hostPort = 9001
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.logs.name
-          "awslogs-region"        = data.aws_region.current.name
-          "awslogs-stream-prefix" = "indexing_model"
         }
       }
     }

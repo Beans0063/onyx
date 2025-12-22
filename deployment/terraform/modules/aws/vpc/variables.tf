@@ -27,3 +27,9 @@ variable "tags" {
   description = "Tags to apply to all VPC-related resources"
   default     = {}
 }
+
+variable "single_nat_gateway" {
+  type        = bool
+  description = "Should be true if you want to provision a single shared NAT Gateway across all your private networks"
+  default     = false
+}

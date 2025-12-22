@@ -1,0 +1,10 @@
+# Copy this file to terraform.tfvars and fill in your values
+# DO NOT commit terraform.tfvars to source control!
+
+# Required - Database Credentials
+postgres_password = "your-secure-password-here"
+redis_auth_token  = "your-secure-redis-token-here"
+
+# Optional - Override defaults
+# postgres_username = "onyx_root"
+# region            = "us-west-2"
