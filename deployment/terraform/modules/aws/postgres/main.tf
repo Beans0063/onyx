@@ -42,7 +42,8 @@ resource "aws_db_instance" "this" {
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.this.id]
   publicly_accessible    = false
-  deletion_protection    = true
+  deletion_protection    = false  # POC: Allow deletion
+  skip_final_snapshot    = true   # POC: Skip snapshot on delete
   storage_encrypted      = true
   tags                   = var.tags
 }

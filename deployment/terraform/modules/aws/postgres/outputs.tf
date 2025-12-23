@@ -1,6 +1,11 @@
 output "endpoint" {
-  description = "RDS endpoint hostname"
+  description = "RDS endpoint (host:port format)"
   value       = aws_db_instance.this.endpoint
+}
+
+output "address" {
+  description = "RDS hostname only (without port)"
+  value       = aws_db_instance.this.address
 }
 
 output "port" {

@@ -34,7 +34,7 @@ module "postgres" {
   ingress_cidrs = [module.vpc.vpc_cidr_block]
   username      = var.postgres_username
   password      = var.postgres_password
-  instance_type = "db.t4g.micro" # POC: Smallest instance
+  instance_type = "db.t4g.small" # POC: Small instance (micro was too slow for migrations)
   storage_gb    = 10              # POC: Minimal storage
   tags          = local.tags
 }
@@ -166,18 +166,34 @@ resource "aws_ecs_cluster" "main" {
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
+# S3 BUCKET (for file storage)
+# ---------------------------------------------------------------------------------------------------------------------
+resource "aws_s3_bucket" "file_store" {
+  bucket = "${local.name}-file-store"
+  tags   = local.tags
+}
+
+resource "aws_s3_bucket_versioning" "file_store" {
+  bucket = aws_s3_bucket.file_store.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "file_store" {
+  bucket = aws_s3_bucket.file_store.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
 # GITHUB ACTIONS OIDC (for CI/CD to push to ECR)
 # ---------------------------------------------------------------------------------------------------------------------
 
-data "aws_iam_openid_connect_provider" "github" {
-  count = length(data.aws_iam_openid_connect_providers.github.arns) > 0 ? 1 : 0
-  arn   = data.aws_iam_openid_connect_providers.github.arns[0]
-}
-
-data "aws_iam_openid_connect_providers" "github" {}
-
 resource "aws_iam_openid_connect_provider" "github" {
-  count           = length(data.aws_iam_openid_connect_providers.github.arns) == 0 ? 1 : 0
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1", "1c58a3a8518e8759bf075b76b750d4f2df264fcd"]
@@ -192,7 +208,7 @@ resource "aws_iam_role" "github_actions" {
       {
         Effect = "Allow"
         Principal = {
-          Federated = length(data.aws_iam_openid_connect_providers.github.arns) > 0 ? data.aws_iam_openid_connect_providers.github.arns[0] : aws_iam_openid_connect_provider.github[0].arn
+          Federated = aws_iam_openid_connect_provider.github.arn
         }
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
@@ -361,19 +377,25 @@ module "tenant_demo" {
   web_image     = "008939990372.dkr.ecr.us-west-2.amazonaws.com/onyx/web-server"
   backend_image = "008939990372.dkr.ecr.us-west-2.amazonaws.com/onyx/backend"
 
-  # Shared services
-  postgres_host     = module.postgres.endpoint
+  # Shared services (use address, not endpoint - endpoint includes port)
+  postgres_host     = module.postgres.address
   postgres_user     = var.postgres_username
   postgres_password = var.postgres_password
   postgres_db       = "onyx_customer_a"
   vespa_host        = module.vespa_ec2.private_ip
   redis_host        = module.redis.redis_endpoint
+  redis_password    = var.redis_auth_token
+  redis_ssl         = true
 
   # Cloud embeddings - configure via Onyx Admin UI after deployment
   # No model servers needed - saves ~$60/month!
 
-  container_cpu    = 512  # POC: 0.5 vCPU
-  container_memory = 1024 # POC: 1 GB RAM
+  # S3 file storage
+  s3_bucket_name = aws_s3_bucket.file_store.id
+  s3_bucket_arn  = aws_s3_bucket.file_store.arn
+
+  container_cpu    = 1024 # POC: 1 vCPU (increased for migrations)
+  container_memory = 2048 # POC: 2 GB RAM (increased for migrations)
 }
 
 # Uncomment to add another tenant

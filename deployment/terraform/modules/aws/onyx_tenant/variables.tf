@@ -98,6 +98,19 @@ variable "redis_host" {
   type        = string
 }
 
+variable "redis_password" {
+  description = "Redis authentication password"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "redis_ssl" {
+  description = "Enable SSL/TLS for Redis connection"
+  type        = bool
+  default     = true
+}
+
 # App Configs
 variable "auth_type" {
     description = "Authentication type (basic, cloud, etc.)"
@@ -115,4 +128,15 @@ variable "container_memory" {
     description = "Memory for the task"
     type = number
     default = 2048 # 2 GB
+}
+
+# S3 File Storage
+variable "s3_bucket_name" {
+  description = "S3 bucket name for file storage"
+  type        = string
+}
+
+variable "s3_bucket_arn" {
+  description = "S3 bucket ARN for IAM policy"
+  type        = string
 }

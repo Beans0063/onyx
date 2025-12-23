@@ -77,6 +77,31 @@ resource "aws_iam_role" "task_role" {
   tags = local.custom_tags
 }
 
+resource "aws_iam_role_policy" "task_s3_access" {
+  name = "${local.name_prefix}-s3-access"
+  role = aws_iam_role.task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:HeadBucket"
+        ]
+        Resource = [
+          var.s3_bucket_arn,
+          "${var.s3_bucket_arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
 # ---------------------------------------------------------------------------------------------------------------------
 # LOGGING
 # ---------------------------------------------------------------------------------------------------------------------
@@ -148,9 +173,13 @@ resource "aws_ecs_task_definition" "app" {
         { name = "POSTGRES_DB", value = var.postgres_db },
         { name = "VESPA_HOST", value = var.vespa_host },
         { name = "REDIS_HOST", value = var.redis_host },
+        { name = "REDIS_PASSWORD", value = var.redis_password },
+        { name = "REDIS_SSL", value = var.redis_ssl ? "true" : "false" },
         { name = "WEB_DOMAIN", value = var.domain_name },
         # Disable local model server - using cloud embedding APIs
         { name = "DISABLE_MODEL_SERVER", value = "True" },
+        # S3 file storage
+        { name = "S3_FILE_STORE_BUCKET_NAME", value = var.s3_bucket_name },
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -174,9 +203,13 @@ resource "aws_ecs_task_definition" "app" {
         { name = "POSTGRES_DB", value = var.postgres_db },
         { name = "VESPA_HOST", value = var.vespa_host },
         { name = "REDIS_HOST", value = var.redis_host },
+        { name = "REDIS_PASSWORD", value = var.redis_password },
+        { name = "REDIS_SSL", value = var.redis_ssl ? "true" : "false" },
         { name = "WEB_DOMAIN", value = var.domain_name },
         # Disable local model server - using cloud embedding APIs
         { name = "DISABLE_MODEL_SERVER", value = "True" },
+        # S3 file storage
+        { name = "S3_FILE_STORE_BUCKET_NAME", value = var.s3_bucket_name },
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -241,6 +274,9 @@ resource "aws_ecs_service" "app" {
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = 1
   launch_type     = "FARGATE"
+
+  # Give time for database migrations to complete before health checks start
+  health_check_grace_period_seconds = 600
 
   network_configuration {
     subnets          = var.private_subnet_ids
