@@ -1,23 +1,27 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import SvgCheck from "@/icons/check";
-import SvgCode from "@/icons/code";
-import SvgTwoLineSmall from "@/icons/two-line-small";
-import SvgOnyxOctagon from "@/icons/onyx-octagon";
-import SvgSearch from "@/icons/search";
-import { IconProps } from "@/icons";
+import type { IconProps } from "@opal/types";
 import Text from "@/refresh-components/texts/Text";
+import Image from "next/image";
+import { DEFAULT_AGENT_AVATAR_SIZE_PX } from "@/lib/constants";
+import {
+  SvgCheck,
+  SvgCode,
+  SvgOnyxOctagon,
+  SvgSearch,
+  SvgTwoLineSmall,
+} from "@opal/icons";
 
 interface IconConfig {
   Icon: React.FunctionComponent<IconProps>;
   className?: string;
 }
 
-const iconMap: Record<string, IconConfig> = {
-  search: { Icon: SvgSearch, className: "stroke-green-500" },
-  check: { Icon: SvgCheck, className: "stroke-green-500" },
-  code: { Icon: SvgCode, className: "stroke-orange-500" },
+const avatarIconMap: Record<string, IconConfig> = {
+  search: { Icon: SvgSearch, className: "stroke-theme-green-05" },
+  check: { Icon: SvgCheck, className: "stroke-theme-green-05" },
+  code: { Icon: SvgCode, className: "stroke-theme-orange-04" },
 };
 
 interface SvgOctagonWrapperProps {
@@ -49,25 +53,26 @@ export default function CustomAgentAvatar({
   src,
   iconName,
 
-  size = 18,
+  size = DEFAULT_AGENT_AVATAR_SIZE_PX,
 }: CustomAgentAvatarProps) {
   if (src) {
     return (
       <div
-        className="aspect-square rounded-full overflow-hidden"
+        className="aspect-square rounded-full overflow-hidden relative"
         style={{ height: size, width: size }}
       >
-        <img
-          alt={name}
+        <Image
+          alt={name || "Agent avatar"}
           src={src}
-          loading="lazy"
-          className="h-full w-full object-cover object-center"
+          fill
+          className="object-cover object-center"
+          sizes={`${size}px`}
         />
       </div>
     );
   }
 
-  const iconConfig = iconName && iconMap[iconName];
+  const iconConfig = iconName && avatarIconMap[iconName];
   if (iconConfig) {
     const { Icon, className } = iconConfig;
     return (

@@ -23,6 +23,7 @@ import {
 } from "../../../../../components/dateRangeSelectors/AdminDateRangeSelector";
 import { PageSelector } from "@/components/PageSelector";
 import Link from "next/link";
+import type { Route } from "next";
 import { FeedbackBadge } from "./FeedbackBadge";
 import KickoffCSVExport from "./KickoffCSVExport";
 import CardSection from "@/components/admin/CardSection";
@@ -44,11 +45,12 @@ import { humanReadableFormatWithTime } from "@/lib/time";
 import Modal from "@/refresh-components/Modal";
 import Button from "@/refresh-components/buttons/Button";
 import { Badge } from "@/components/ui/badge";
-import SvgMinusCircle from "@/icons/minus-circle";
-import SvgThumbsDown from "@/icons/thumbs-down";
-import SvgThumbsUp from "@/icons/thumbs-up";
-import SvgFileText from "@/icons/file-text";
-
+import {
+  SvgFileText,
+  SvgMinusCircle,
+  SvgThumbsDown,
+  SvgThumbsUp,
+} from "@opal/icons";
 function QueryHistoryTableRow({
   chatSessionMinimal,
 }: {
@@ -82,7 +84,9 @@ function QueryHistoryTableRow({
       {/* Wrapping in <td> to avoid console warnings */}
       <td className="w-0 p-0">
         <Link
-          href={`/admin/performance/query-history/${chatSessionMinimal.id}`}
+          href={
+            `/ee/admin/performance/query-history/${chatSessionMinimal.id}` as Route
+          }
           className="absolute w-full h-full left-0"
         ></Link>
       </td>
@@ -205,7 +209,7 @@ function PreviousQueryHistoryExportsModal({
                       </TableCell>
                       <TableCell>
                         {task.status === "SUCCESS" ? (
-                          <Link
+                          <a
                             className="flex justify-center"
                             href={withRequestId(
                               DOWNLOAD_QUERY_HISTORY_URL,
@@ -213,7 +217,7 @@ function PreviousQueryHistoryExportsModal({
                             )}
                           >
                             <FiDownload color="primary" />
-                          </Link>
+                          </a>
                         ) : (
                           <FiDownload color="primary" className="opacity-20" />
                         )}
