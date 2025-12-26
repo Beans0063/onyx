@@ -15,8 +15,8 @@ resource "aws_security_group" "ecs_task" {
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port       = 3000
-    to_port         = 3000
+    from_port       = 80
+    to_port         = 80
     protocol        = "tcp"
     security_groups = [var.alb_security_group_id]
   }
@@ -126,6 +126,43 @@ resource "aws_ecs_task_definition" "app" {
   # Container definitions - uses cloud embedding APIs (OpenAI/Cohere/etc.)
   # Model servers removed for cost savings. Configure embedding provider via Onyx Admin UI.
   container_definitions = jsonencode([
+    # NGINX - Reverse proxy for routing
+    {
+      name      = "nginx"
+      image     = "nginx:1.25.5-alpine"
+      essential = true
+      portMappings = [
+        {
+          containerPort = 80
+          hostPort      = 80
+          protocol      = "tcp"
+        }
+      ]
+      environment = [
+        { name = "ONYX_BACKEND_API_HOST", value = "localhost" },
+        { name = "ONYX_WEB_SERVER_HOST", value = "localhost" },
+        { name = "NGINX_PROXY_CONNECT_TIMEOUT", value = "300" },
+        { name = "NGINX_PROXY_SEND_TIMEOUT", value = "300" },
+        { name = "NGINX_PROXY_READ_TIMEOUT", value = "300" },
+      ]
+      # Use command to download nginx config and start
+      command = [
+        "/bin/sh", "-c",
+        "apk add --no-cache curl dos2unix && mkdir -p /etc/nginx/conf.d && curl -s https://raw.githubusercontent.com/onyx-dot-app/onyx/main/deployment/data/nginx/app.conf.template > /etc/nginx/conf.d/app.conf.template && curl -s https://raw.githubusercontent.com/onyx-dot-app/onyx/main/deployment/data/nginx/run-nginx.sh > /etc/nginx/conf.d/run-nginx.sh && echo '' > /etc/nginx/conf.d/mcp_upstream.conf.inc && echo '' > /etc/nginx/conf.d/mcp.conf.inc && chmod +x /etc/nginx/conf.d/run-nginx.sh && dos2unix /etc/nginx/conf.d/run-nginx.sh && /etc/nginx/conf.d/run-nginx.sh app.conf.template"
+      ]
+      dependsOn = [
+        { containerName = "api_server", condition = "START" },
+        { containerName = "web_server", condition = "START" }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.logs.name
+          "awslogs-region"        = data.aws_region.current.id
+          "awslogs-stream-prefix" = "nginx"
+        }
+      }
+    },
     # WEB SERVER
     {
       name      = "web_server"
@@ -142,6 +179,8 @@ resource "aws_ecs_task_definition" "app" {
         { name = "INTERNAL_URL", value = "http://localhost:8080" },
         { name = "WEB_DOMAIN", value = var.domain_name },
         { name = "NEXT_PUBLIC_DISABLE_LOGOUT", value = "false" },
+        # Force Next.js to bind to 0.0.0.0 so nginx can connect via localhost
+        { name = "HOSTNAME", value = "0.0.0.0" },
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -229,8 +268,8 @@ resource "aws_ecs_task_definition" "app" {
 # LOAD BALANCER TARGET GROUP
 # ---------------------------------------------------------------------------------------------------------------------
 resource "aws_lb_target_group" "target" {
-  name        = "${local.name_prefix}-tg"
-  port        = 3000
+  name_prefix = substr("${local.name_prefix}-", 0, 6)
+  port        = 80
   protocol    = "HTTP"
   vpc_id      = var.vpc_id
   target_type = "ip"
@@ -238,13 +277,17 @@ resource "aws_lb_target_group" "target" {
   health_check {
     path                = "/health"
     interval            = 30
-    timeout             = 5
+    timeout             = 10
     healthy_threshold   = 2
-    unhealthy_threshold = 2
+    unhealthy_threshold = 5
     matcher             = "200"
   }
 
   tags = local.custom_tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -286,8 +329,8 @@ resource "aws_ecs_service" "app" {
 
   load_balancer {
     target_group_arn = aws_lb_target_group.target.arn
-    container_name   = "web_server"
-    container_port   = 3000
+    container_name   = "nginx"
+    container_port   = 80
   }
 
   tags = local.custom_tags

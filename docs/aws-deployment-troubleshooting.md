@@ -7,14 +7,15 @@ This guide documents common issues encountered during Onyx AWS deployments and p
 ## Table of Contents
 
 1. [Terraform Destroy/Apply Cycle](#terraform-destroyapply-cycle)
-2. [ECS Task Troubleshooting](#ecs-task-troubleshooting)
-3. [Database Issues](#database-issues)
-4. [Redis/Cache Issues](#rediscache-issues)
-5. [Vespa Vector Search Issues](#vespa-vector-search-issues)
-6. [S3 Storage Issues](#s3-storage-issues)
-7. [Resource Sizing Issues](#resource-sizing-issues)
-8. [Health Check Failures](#health-check-failures)
-9. [Quick Reference Commands](#quick-reference-commands)
+2. [API/Nginx Routing Issues](#apinginx-routing-issues)
+3. [ECS Task Troubleshooting](#ecs-task-troubleshooting)
+4. [Database Issues](#database-issues)
+5. [Redis/Cache Issues](#rediscache-issues)
+6. [Vespa Vector Search Issues](#vespa-vector-search-issues)
+7. [S3 Storage Issues](#s3-storage-issues)
+8. [Resource Sizing Issues](#resource-sizing-issues)
+9. [Health Check Failures](#health-check-failures)
+10. [Quick Reference Commands](#quick-reference-commands)
 
 ---
 
@@ -161,6 +162,168 @@ watch -n 10 'aws ecs describe-services --cluster onyx-prod-cluster --services cu
 - `./scripts/pause-demo.sh --resume` - Restart paused resources
 - `./scripts/pause-demo.sh --status` - Check current state
 - `./scripts/safe-destroy.sh` - Create backups before destroy (RDS snapshot, S3 copy)
+
+---
+
+## API/Nginx Routing Issues
+
+Onyx requires an nginx reverse proxy to properly route requests between the web frontend and API backend. Without nginx, the application will appear to load but API requests will fail.
+
+### Symptom: "Backend is currently unavailable"
+
+**What You See**:
+- Browser shows header: "The backend is currently unavailable"
+- Login page loads but you cannot authenticate
+- API requests like `curl https://demo.vigilon.app/api/me` return:
+  ```json
+  {"message": "This API is only available in development mode"}
+  ```
+  with HTTP 404
+
+**Root Cause**: The ECS task is missing the nginx container. Without nginx:
+- External requests hit the web server directly on port 3000
+- The web server doesn't know how to handle `/api/*` routes
+- The web server returns the "development mode" error for unknown routes
+
+**Solution**: The ECS task definition must include 4 containers:
+1. **nginx** (port 80) - Routes `/api/*` to api_server, everything else to web_server
+2. **api_server** (port 8080) - Python backend
+3. **web_server** (port 3000) - Next.js frontend
+4. **background** - Background workers
+
+The nginx container downloads the official Onyx nginx config and handles routing:
+```
+/api/*           → api_server:8080 (strips /api prefix)
+/openapi.json    → api_server:8080
+/*               → web_server:3000
+```
+
+### Symptom: 502 Bad Gateway on Non-API Routes
+
+**What You See**:
+- `/api/me` returns proper 403 (authentication required)
+- `/auth/login` returns 502 Bad Gateway
+- `/health` returns 502 Bad Gateway
+
+**Nginx Error Log**:
+```
+connect() failed (111: Connection refused) while connecting to upstream,
+upstream: "http://127.0.0.1:3000/health"
+```
+
+**Root Cause**: The Next.js web server is binding to the container's hostname IP instead of `0.0.0.0`. In ECS Fargate, Next.js binds to the ENI IP (e.g., `10.0.38.153`) rather than localhost, so nginx can't connect via `127.0.0.1`.
+
+**Solution**: Add `HOSTNAME=0.0.0.0` environment variable to the web_server container:
+```hcl
+environment = [
+  { name = "INTERNAL_URL", value = "http://localhost:8080" },
+  { name = "WEB_DOMAIN", value = var.domain_name },
+  { name = "NEXT_PUBLIC_DISABLE_LOGOUT", value = "false" },
+  # Force Next.js to bind to 0.0.0.0 so nginx can connect via localhost
+  { name = "HOSTNAME", value = "0.0.0.0" },
+]
+```
+
+### Diagnosing Nginx Issues
+
+#### Check Container Status
+```bash
+# Get task ID
+TASK_ID=$(aws ecs list-tasks --cluster onyx-prod-cluster \
+  --service-name customer-a-prod-service \
+  --query 'taskArns[0]' --output text | rev | cut -d'/' -f1 | rev)
+
+# Check all containers are running
+aws ecs describe-tasks --cluster onyx-prod-cluster --tasks $TASK_ID \
+  --query 'tasks[0].containers[*].{name:name,status:lastStatus}' --output table
+```
+
+#### Check Nginx Logs
+```bash
+# View nginx startup and error logs
+aws logs get-log-events \
+  --log-group-name /ecs/customer-a-prod \
+  --log-stream-name nginx/nginx/$TASK_ID \
+  --limit 100 --query 'events[*].message' --output text
+```
+
+**Healthy nginx startup looks like**:
+```
+Using API server host: localhost
+Using web server host: localhost
+Waiting for API server to boot up...
+API server responded with 200, starting nginx...
+start worker processes
+```
+
+**Unhealthy signs**:
+```
+API server responded with 000, retrying...  # API not ready yet (normal during startup)
+connect() failed (111: Connection refused)  # Web server binding issue
+```
+
+#### Check API Server Logs
+```bash
+aws logs get-log-events \
+  --log-group-name /ecs/customer-a-prod \
+  --log-stream-name api/api_server/$TASK_ID \
+  --limit 50 --query 'events[*].message' --output text
+```
+
+**Healthy API startup ends with**:
+```
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080
+```
+
+### Terraform Target Group Changes
+
+When changing the target group port (e.g., from 3000 to 80 for nginx), Terraform may fail with:
+```
+Error: deleting ELBv2 Target Group: ResourceInUse:
+Target group is currently in use by a listener or a rule
+```
+
+**Solution**: Add `create_before_destroy` lifecycle and use `name_prefix` instead of `name`:
+```hcl
+resource "aws_lb_target_group" "target" {
+  name_prefix = substr("${local.name_prefix}-", 0, 6)
+  port        = 80
+  protocol    = "HTTP"
+  # ...
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+This allows Terraform to:
+1. Create a new target group with the new configuration
+2. Update the listener rule to point to the new target group
+3. Delete the old target group
+
+### Container Architecture Summary
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           ECS Fargate Task              │
+                    │                                         │
+  ALB:443 ──────────┼──▶ nginx:80                             │
+                    │       │                                 │
+                    │       ├── /api/* ──▶ api_server:8080    │
+                    │       │                                 │
+                    │       └── /*     ──▶ web_server:3000    │
+                    │                                         │
+                    │       background (no port)              │
+                    └─────────────────────────────────────────┘
+```
+
+**Key Requirements**:
+- ALB target group must point to nginx on port 80
+- Security group must allow port 80 from ALB
+- Load balancer config: `container_name = "nginx"`, `container_port = 80`
+- Web server needs `HOSTNAME=0.0.0.0` for Next.js
 
 ---
 
@@ -771,6 +934,10 @@ Service Not Running
 - [ ] Vespa EC2 security group allows ECS traffic on ports 8080, 19071
 - [ ] PostgreSQL connection uses `address` (not `endpoint`) to avoid port duplication
 - [ ] All secrets are in Secrets Manager and referenced correctly in task definition
+- [ ] ECS task includes all 4 containers: nginx, api_server, web_server, background
+- [ ] ALB target group points to nginx container on port 80
+- [ ] Web server has `HOSTNAME=0.0.0.0` environment variable for Next.js
+- [ ] Security group allows port 80 (not 3000) from ALB
 
 ### After Terraform Destroy/Apply
 
@@ -779,6 +946,8 @@ Service Not Running
 - [ ] Verify ECS tasks are running: `aws ecs describe-services ...`
 - [ ] Force ECS redeployment if tasks started before database existed
 - [ ] Test site loads at https://demo.vigilon.app
+- [ ] Verify API routing works: `curl https://demo.vigilon.app/api/me` returns 403 (not 404)
+- [ ] Verify no "backend unavailable" message in browser
 - [ ] Configure embedding provider in admin UI (if using cloud embeddings)
 
 ### Before Terraform Destroy (If Data Matters)
